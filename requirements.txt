@@ -1,0 +1,53 @@
+# Core dependencies for Audio-Visual Fusion with YOLO and ReSpeaker
+# Install with: pip install -r requirements.txt
+#
+# NOTE for Jetson: prefer using the system OpenCV package (python3-opencv via apt)
+# because opencv-python / opencv-python-headless often fail on aarch64.
+# If you do want the pip package (non-Jetson), uncomment the opencv line below.
+
+# Computer Vision
+# For non-Jetson desktops/servers you can enable the pip OpenCV:
+# opencv-python>=4.6.0
+ultralytics>=8.0.0
+numpy>=1.23.0
+
+# Audio Processing
+sounddevice>=0.4.5
+# pyaudio often builds poorly on embedded devices; prefer system package (apt) on Jetson:
+# pyaudio>=0.2.11  # optional
+
+# USB Device Communication (ReSpeaker)
+pyusb==1.0.2
+click>=7.1.2
+
+# Utilities / extras
+typing-extensions>=4.5.0
+Pillow>=9.0.0
+
+# Tracking (optional)
+# ByteTrack has a dependency conflict with modern PyTorch (requires torch==1.13.0)
+# For Jetson with PyTorch 2.0+, install ByteTrack without dependencies:
+# pip install --no-deps git+https://github.com/ifzhang/ByteTrack.git@main
+# Then manually install other ByteTrack deps if needed (lap, cython-bbox, etc.)
+# bytetrack @ git+https://github.com/ifzhang/ByteTrack.git@main
+
+# Optional advanced trackers (choose one if needed)
+# deep-sort-realtime>=1.6.0
+
+# PyTorch / torchvision
+# IMPORTANT: On Jetson, install the Jetson-optimized wheel matching your JetPack/Python
+# (do NOT pip install torch from PyPI on Jetson - it will be CPU-only!).
+#
+# For Jetson JetPack 5.x (L4T R35.x) with Python 3.8:
+# 1. Uninstall any existing PyTorch: pip uninstall torch torchvision
+# 2. Install NVIDIA's CUDA-enabled wheel:
+#    pip install --no-cache-dir https://developer.download.nvidia.com/compute/redist/jp/v50/pytorch/torch-2.0.0+nv23.05-cp38-cp38-linux_aarch64.whl
+# 3. Install torchvision (compatible version):
+#    pip install --no-deps torchvision==0.15.1
+#
+# For non-Jetson x86_64 systems with CUDA 11.8:
+# torch>=2.0.0
+# torchvision>=0.15.0
+#
+# The script will auto-detect CUDA and use GPU if available
+
