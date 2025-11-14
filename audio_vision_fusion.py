@@ -23,7 +23,9 @@ import signal
 import logging
 import platform
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, List
+from collections import deque
+from dataclasses import dataclass
 import torch
 
 # Setup logging
@@ -76,6 +78,192 @@ TRACKING_IOU_THRESHOLD = float(os.getenv('TRACKING_IOU_THRESHOLD', '0.5'))  # Io
 SOUND_HISTORY_WINDOW = float(os.getenv('SOUND_HISTORY_WINDOW', '2.0'))  # Seconds to keep sound history
 DOA_LOCK_TOLERANCE = float(os.getenv('DOA_LOCK_TOLERANCE', '20'))  # Max angle difference to lock (degrees)
 SOUND_HIT_DEBOUNCE = float(os.getenv('SOUND_HIT_DEBOUNCE', '0.3'))  # Minimum seconds between sound hits
+AUDIO_OVERFLOW_LOG_INTERVAL = int(os.getenv('AUDIO_OVERFLOW_LOG_INTERVAL', '10'))  # Log every N overflows
+
+# Enhancement features configuration
+ENABLE_PERFORMANCE_MONITOR = os.getenv('ENABLE_PERFORMANCE_MONITOR', 'True').lower() == 'true'
+ENABLE_AUDIO_HEATMAP = os.getenv('ENABLE_AUDIO_HEATMAP', 'True').lower() == 'true'
+HEATMAP_DECAY_RATE = float(os.getenv('HEATMAP_DECAY_RATE', '0.95'))  # Per-frame decay
+HEATMAP_INTENSITY = float(os.getenv('HEATMAP_INTENSITY', '0.3'))  # Blob intensity
+HEATMAP_BLOB_SIZE_X = int(os.getenv('HEATMAP_BLOB_SIZE_X', '80'))  # Horizontal spread (pixels)
+HEATMAP_BLOB_SIZE_Y = int(os.getenv('HEATMAP_BLOB_SIZE_Y', '100'))  # Vertical spread (pixels)
+# =======================================================
+
+
+# ==================== Performance Monitor ====================
+class PerformanceMonitor:
+    """
+    Lightweight performance tracking with minimal overhead.
+    
+    Features:
+    - FPS calculation with rolling average
+    - YOLO inference latency tracking
+    - GPU memory monitoring (CUDA)
+    - Optional Jetson-specific metrics (jtop)
+    - Optional CPU/RAM metrics (psutil)
+    """
+    
+    def __init__(self, window_size: int = 30):
+        """
+        Initialize performance monitor.
+        
+        Args:
+            window_size: Number of frames to average for metrics
+        """
+        self.window_size = window_size
+        self.frame_times = deque(maxlen=window_size)
+        self.yolo_times = deque(maxlen=window_size)
+        self.last_frame_time = time.time()
+        
+        # Try to import optional monitoring libraries
+        self.psutil = None
+        self.jtop = None
+        
+        try:
+            import psutil
+            self.psutil = psutil
+            logger.info("✓ psutil available for CPU/RAM monitoring")
+        except ImportError:
+            logger.debug("psutil not available (optional)")
+        
+        # Try Jetson-specific monitoring
+        try:
+            from jtop import jtop
+            self.jtop_instance = jtop()
+            self.jtop_instance.start()
+            self.jtop = True
+            logger.info("✓ jtop available for Jetson metrics")
+        except:
+            logger.debug("jtop not available (optional, Jetson-only)")
+        
+        self.cuda_available = torch.cuda.is_available()
+        if self.cuda_available:
+            logger.info("✓ CUDA available for GPU monitoring")
+    
+    def start_frame(self):
+        """Mark the start of a frame (call at beginning of loop)."""
+        self.last_frame_time = time.time()
+    
+    def update(self, yolo_time: float):
+        """
+        Update metrics after frame processing.
+        
+        Args:
+            yolo_time: Time taken for YOLO inference (seconds)
+        """
+        current_time = time.time()
+        frame_time = current_time - self.last_frame_time
+        
+        self.frame_times.append(frame_time)
+        self.yolo_times.append(yolo_time)
+    
+    def get_metrics(self) -> Dict[str, float]:
+        """
+        Get current performance metrics.
+        
+        Returns:
+            Dictionary of metric names and values
+        """
+        metrics = {}
+        
+        # FPS calculation
+        if self.frame_times:
+            avg_frame_time = sum(self.frame_times) / len(self.frame_times)
+            metrics['fps'] = 1.0 / avg_frame_time if avg_frame_time > 0 else 0.0
+        else:
+            metrics['fps'] = 0.0
+        
+        # YOLO latency
+        if self.yolo_times:
+            metrics['yolo_latency_ms'] = (sum(self.yolo_times) / len(self.yolo_times)) * 1000
+        else:
+            metrics['yolo_latency_ms'] = 0.0
+        
+        # GPU metrics (if CUDA available)
+        if self.cuda_available:
+            try:
+                metrics['gpu_memory_mb'] = torch.cuda.memory_allocated() / 1e6
+                metrics['gpu_memory_reserved_mb'] = torch.cuda.memory_reserved() / 1e6
+            except:
+                pass
+        
+        # Jetson-specific metrics (if available)
+        if self.jtop and self.jtop_instance:
+            try:
+                stats = self.jtop_instance.stats
+                if stats:
+                    metrics['gpu_utilization'] = stats.get('GR3D', 0)
+                    metrics['cpu_utilization'] = stats.get('CPU', 0)
+                    metrics['ram_usage_mb'] = stats.get('RAM', 0)
+                    temp = stats.get('Temp', {})
+                    if isinstance(temp, dict):
+                        metrics['temperature_c'] = temp.get('thermal', 0)
+            except:
+                pass
+        
+        # CPU/RAM metrics (if psutil available and not Jetson)
+        elif self.psutil:
+            try:
+                metrics['cpu_utilization'] = self.psutil.cpu_percent(interval=0)
+                metrics['ram_usage_mb'] = self.psutil.virtual_memory().used / 1e6
+            except:
+                pass
+        
+        return metrics
+    
+    def draw_overlay(self, frame: np.ndarray, x: int = 10, y: int = 30):
+        """
+        Draw performance metrics overlay on frame.
+        
+        Args:
+            frame: Image frame to draw on
+            x, y: Top-left position for overlay
+        """
+        metrics = self.get_metrics()
+        
+        # Build display lines
+        lines = [
+            f"FPS: {metrics.get('fps', 0):.1f}",
+            f"YOLO: {metrics.get('yolo_latency_ms', 0):.1f}ms",
+        ]
+        
+        if 'gpu_memory_mb' in metrics:
+            lines.append(f"GPU Mem: {metrics['gpu_memory_mb']:.0f}MB")
+        
+        if 'gpu_utilization' in metrics:
+            lines.append(f"GPU: {metrics['gpu_utilization']:.0f}%")
+        
+        if 'cpu_utilization' in metrics:
+            lines.append(f"CPU: {metrics['cpu_utilization']:.0f}%")
+        
+        if 'temperature_c' in metrics:
+            temp = metrics['temperature_c']
+            # Color code temperature (green < 60, yellow < 75, red >= 75)
+            temp_color = (0, 255, 0) if temp < 60 else (0, 255, 255) if temp < 75 else (0, 0, 255)
+            cv2.putText(frame, f"Temp: {temp:.0f}C", (x, y + len(lines) * 25),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, temp_color, 1, cv2.LINE_AA)
+            lines.append("")  # Placeholder for positioning
+        
+        # Draw text with semi-transparent background
+        for i, line in enumerate(lines[:-1] if lines[-1] == "" else lines):
+            if not line:
+                continue
+            y_pos = y + (i * 25)
+            # Add shadow for better visibility
+            cv2.putText(frame, line, (x + 1, y_pos + 1),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2, cv2.LINE_AA)
+            cv2.putText(frame, line, (x, y_pos),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+    
+    def cleanup(self):
+        """Clean up resources."""
+        if self.jtop and self.jtop_instance:
+            try:
+                self.jtop_instance.close()
+            except:
+                pass
+
+
 # =======================================================
 
 
@@ -106,6 +294,10 @@ class AudioVisionFusion:
         self.model: Optional[YOLO] = None
         self.cap: Optional[cv2.VideoCapture] = None
         
+        # Enhancement features
+        self.performance_monitor = PerformanceMonitor() if ENABLE_PERFORMANCE_MONITOR else None
+        self.audio_heatmap = np.zeros((FRAME_HEIGHT, FRAME_WIDTH), dtype=np.float32) if ENABLE_AUDIO_HEATMAP else None
+        
         # Setup signal handlers for graceful shutdown
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
@@ -119,6 +311,10 @@ class AudioVisionFusion:
         assert TRIGGER_HOLD_TIME > 0, f"Trigger hold time must be positive, got {TRIGGER_HOLD_TIME}"
         assert DOA_SNAP_TOLERANCE >= 0, f"DOA snap tolerance must be non-negative, got {DOA_SNAP_TOLERANCE}"
         assert 0 <= YOLO_CONFIDENCE_THRESHOLD <= 1, f"YOLO confidence must be 0-1, got {YOLO_CONFIDENCE_THRESHOLD}"
+        assert TRACKING_IOU_THRESHOLD > 0 and TRACKING_IOU_THRESHOLD <= 1, \
+            f"IoU threshold must be 0-1, got {TRACKING_IOU_THRESHOLD}"
+        assert SOUND_HIT_DEBOUNCE >= 0, \
+            f"Sound debounce must be non-negative, got {SOUND_HIT_DEBOUNCE}"
         logger.info("Configuration validation passed")
     
     def setup_platform_checks(self):
@@ -146,6 +342,95 @@ class AudioVisionFusion:
         logger.info("\nReceived shutdown signal, cleaning up...")
         self.cleanup()
         sys.exit(0)
+    
+    def reload_config(self):
+        """
+        Hot-reload configuration from environment without restart.
+        Thread-safe and validates new values before applying.
+        
+        Returns:
+            bool: True if reload successful, False otherwise
+        """
+        logger.info("🔄 Reloading configuration...")
+        
+        # Reload .env file if exists
+        env_file = Path('.env')
+        if env_file.exists():
+            try:
+                # Try to import python-dotenv
+                try:
+                    from dotenv import load_dotenv
+                    load_dotenv(override=True)
+                    logger.info("✓ Loaded .env file")
+                except ImportError:
+                    logger.warning("python-dotenv not installed, using environment variables")
+            except Exception as e:
+                logger.error(f"Error loading .env: {e}")
+                return False
+        
+        # Read new configuration values
+        try:
+            new_config = {
+                'SOUND_THRESHOLD_DB': float(os.getenv('SOUND_THRESHOLD_DB', '-30')),
+                'DOA_LOCK_TOLERANCE': float(os.getenv('DOA_LOCK_TOLERANCE', '20')),
+                'MAX_SOUND_HITS': int(os.getenv('MAX_SOUND_HITS', '5')),
+                'YOLO_CONFIDENCE_THRESHOLD': float(os.getenv('YOLO_CONFIDENCE_THRESHOLD', '0.25')),
+                'TRACKING_IOU_THRESHOLD': float(os.getenv('TRACKING_IOU_THRESHOLD', '0.5')),
+                'SOUND_HIT_DEBOUNCE': float(os.getenv('SOUND_HIT_DEBOUNCE', '0.3')),
+                'TRIGGER_HOLD_TIME': float(os.getenv('TRIGGER_HOLD_TIME', '0.5')),
+                'DOA_SNAP_TOLERANCE': float(os.getenv('DOA_SNAP_TOLERANCE', '10')),
+            }
+        except ValueError as e:
+            logger.error(f"Invalid config value: {e}")
+            return False
+        
+        # Validate new configuration
+        try:
+            assert new_config['SOUND_THRESHOLD_DB'] <= 0, \
+                f"Sound threshold must be <= 0, got {new_config['SOUND_THRESHOLD_DB']}"
+            assert 0 <= new_config['YOLO_CONFIDENCE_THRESHOLD'] <= 1, \
+                f"YOLO confidence must be 0-1, got {new_config['YOLO_CONFIDENCE_THRESHOLD']}"
+            assert new_config['MAX_SOUND_HITS'] > 0, \
+                f"Max sound hits must be > 0, got {new_config['MAX_SOUND_HITS']}"
+            assert 0 < new_config['TRACKING_IOU_THRESHOLD'] <= 1, \
+                f"IoU threshold must be 0-1, got {new_config['TRACKING_IOU_THRESHOLD']}"
+            assert new_config['SOUND_HIT_DEBOUNCE'] >= 0, \
+                f"Sound debounce must be >= 0, got {new_config['SOUND_HIT_DEBOUNCE']}"
+            assert new_config['TRIGGER_HOLD_TIME'] > 0, \
+                f"Trigger hold time must be > 0, got {new_config['TRIGGER_HOLD_TIME']}"
+            assert new_config['DOA_SNAP_TOLERANCE'] >= 0, \
+                f"DOA snap tolerance must be >= 0, got {new_config['DOA_SNAP_TOLERANCE']}"
+        except AssertionError as e:
+            logger.error(f"Validation failed: {e}")
+            return False
+        
+        # Apply configuration atomically (update globals)
+        global SOUND_THRESHOLD_DB, DOA_LOCK_TOLERANCE, MAX_SOUND_HITS
+        global YOLO_CONFIDENCE_THRESHOLD, TRACKING_IOU_THRESHOLD
+        global SOUND_HIT_DEBOUNCE, TRIGGER_HOLD_TIME, DOA_SNAP_TOLERANCE
+        
+        SOUND_THRESHOLD_DB = new_config['SOUND_THRESHOLD_DB']
+        DOA_LOCK_TOLERANCE = new_config['DOA_LOCK_TOLERANCE']
+        MAX_SOUND_HITS = new_config['MAX_SOUND_HITS']
+        YOLO_CONFIDENCE_THRESHOLD = new_config['YOLO_CONFIDENCE_THRESHOLD']
+        TRACKING_IOU_THRESHOLD = new_config['TRACKING_IOU_THRESHOLD']
+        SOUND_HIT_DEBOUNCE = new_config['SOUND_HIT_DEBOUNCE']
+        TRIGGER_HOLD_TIME = new_config['TRIGGER_HOLD_TIME']
+        DOA_SNAP_TOLERANCE = new_config['DOA_SNAP_TOLERANCE']
+        
+        # Update instance variables
+        self.max_sound_hits = MAX_SOUND_HITS
+        
+        logger.info("✓ Configuration reloaded successfully")
+        logger.info(f"  Sound threshold: {SOUND_THRESHOLD_DB} dB")
+        logger.info(f"  DOA tolerance: {DOA_LOCK_TOLERANCE}°")
+        logger.info(f"  Max sound hits: {MAX_SOUND_HITS}")
+        logger.info(f"  YOLO confidence: {YOLO_CONFIDENCE_THRESHOLD}")
+        logger.info(f"  Tracking IoU: {TRACKING_IOU_THRESHOLD}")
+        logger.info(f"  Sound debounce: {SOUND_HIT_DEBOUNCE}s")
+        logger.info(f"  Trigger hold: {TRIGGER_HOLD_TIME}s")
+        
+        return True
     
     def rms_dbfs(self, audio_samples: np.ndarray) -> float:
         """Compute RMS level in dBFS from audio sample array.
@@ -203,7 +488,7 @@ class AudioVisionFusion:
                     audio_data, overflowed = stream.read(frames_per_chunk)
                     if overflowed:
                         overflow_count += 1
-                        if overflow_count % 10 == 0:  # Log every 10th overflow
+                        if overflow_count % AUDIO_OVERFLOW_LOG_INTERVAL == 0:
                             logger.warning(f"Audio buffer overflow detected ({overflow_count} total)")
                     
                     # Compute sound level (dBFS) for the chunk (use channel 0)
@@ -416,6 +701,162 @@ class AudioVisionFusion:
         
         return intersection_area / union_area if union_area > 0 else 0.0
     
+    def decay_audio_heatmap(self):
+        """
+        Decay heatmap every frame for gradual fade effect.
+        Call this every frame, regardless of sound detection.
+        """
+        if not ENABLE_AUDIO_HEATMAP or self.audio_heatmap is None:
+            return
+        
+        # Apply exponential decay
+        self.audio_heatmap *= HEATMAP_DECAY_RATE
+        
+        # Clear very small values to prevent lingering artifacts
+        self.audio_heatmap[self.audio_heatmap < 0.01] = 0
+    
+    def update_audio_heatmap(self, doa_angle: float, intensity: float = 1.0):
+        """
+        Add new sound detection to heatmap as a circular blob.
+        
+        Args:
+            doa_angle: Direction of arrival angle in degrees (relative to camera)
+            intensity: Sound intensity (0-1), default 1.0
+        """
+        if not ENABLE_AUDIO_HEATMAP or self.audio_heatmap is None:
+            return
+        
+        # Calculate horizontal position from DOA angle
+        # DOA angle is relative to camera center: negative = left, positive = right
+        relative_angle = doa_angle / (CAMERA_FOV / 2)  # Normalize to -1 to 1
+        center_x = int((relative_angle + 1) * FRAME_WIDTH / 2)
+        center_x = np.clip(center_x, 0, FRAME_WIDTH - 1)
+        
+        # Place blob in vertical center (middle of frame)
+        # Since we don't have height information from audio
+        center_y = FRAME_HEIGHT // 2
+        
+        # Create 2D circular Gaussian blob
+        # This creates a circular "hot spot" instead of a vertical line
+        sigma_x = HEATMAP_BLOB_SIZE_X  # Horizontal spread (configurable)
+        sigma_y = HEATMAP_BLOB_SIZE_Y  # Vertical spread (configurable)
+        
+        y, x = np.ogrid[:FRAME_HEIGHT, :FRAME_WIDTH]
+        
+        # 2D Gaussian: circular blob centered at sound direction
+        gaussian = np.exp(
+            -((x - center_x)**2 / (2 * sigma_x**2) + 
+              (y - center_y)**2 / (2 * sigma_y**2))
+        )
+        
+        self.audio_heatmap += gaussian * intensity * HEATMAP_INTENSITY
+        self.audio_heatmap = np.clip(self.audio_heatmap, 0, 1)
+    
+    def draw_audio_heatmap(self, frame: np.ndarray):
+        """
+        Overlay audio heatmap visualization on frame.
+        
+        Args:
+            frame: Image frame to draw on (modified in-place)
+        """
+        if not ENABLE_AUDIO_HEATMAP or self.audio_heatmap is None:
+            return
+        
+        # Convert heatmap to colored overlay using JET colormap
+        heatmap_colored = cv2.applyColorMap(
+            (self.audio_heatmap * 255).astype(np.uint8),
+            cv2.COLORMAP_JET
+        )
+        
+        # Blend with frame where heatmap is visible
+        mask = self.audio_heatmap > 0.1
+        if np.any(mask):
+            frame[mask] = cv2.addWeighted(
+                frame[mask], 0.7,
+                heatmap_colored[mask], 0.3,
+                0
+            )
+    
+    def _reset_tracking(self):
+        """Reset all tracking state."""
+        self.locked_object_id = None
+        self.locked_object_bbox = None
+        self.sound_detections = []
+        self.sound_confidence = 0.0
+    
+    def _find_best_match(self, boxes_xyxy) -> Optional[int]:
+        """Find best matching box for locked object using IoU.
+        
+        Args:
+            boxes_xyxy: Array of bounding boxes in xyxy format
+            
+        Returns:
+            Index of best match or None if no good match found
+        """
+        best_iou = 0.0
+        best_idx = None
+        
+        for i, bbox in enumerate(boxes_xyxy):
+            iou = self.calculate_iou(self.locked_object_bbox, bbox)
+            if iou > best_iou:
+                best_iou = iou
+                best_idx = i
+        
+        if best_iou > TRACKING_IOU_THRESHOLD:
+            self.locked_object_bbox = boxes_xyxy[best_idx]
+            logger.debug(f"Tracking maintained (IoU: {best_iou:.2f})")
+            return best_idx
+        
+        return None
+    
+    def _add_sound_detection(self, current_time: float, doa_angle: float):
+        """Add a sound detection with debouncing.
+        
+        Args:
+            current_time: Current timestamp
+            doa_angle: Direction of arrival angle
+        """
+        last_detection_time = self.sound_detections[-1][0] if self.sound_detections else 0
+        time_since_last = current_time - last_detection_time
+        
+        if time_since_last > SOUND_HIT_DEBOUNCE:
+            self.sound_detections.append((current_time, doa_angle))
+            # Remove old detections outside the history window
+            self.sound_detections = [(t, a) for t, a in self.sound_detections 
+                                    if current_time - t < SOUND_HISTORY_WINDOW]
+            self.sound_confidence = min(1.0, len(self.sound_detections) / self.max_sound_hits)
+            logger.info(f"Sound from locked object! Confidence: {self.sound_confidence*100:.0f}% ({len(self.sound_detections)} hits)")
+        else:
+            logger.debug(f"Sound debounced ({time_since_last:.1f}s < {SOUND_HIT_DEBOUNCE}s)")
+    
+    def _update_tracking(self, detections) -> Optional[int]:
+        """Update object tracking without new sound input.
+        
+        Maintains lock on object if still visible in frame.
+        
+        Args:
+            detections: YOLO detection results
+            
+        Returns:
+            Index of tracked object or None
+        """
+        if self.locked_object_id is None or self.locked_object_bbox is None:
+            return None
+        
+        if len(detections.boxes.cls) == 0:
+            logger.info("No objects detected - resetting lock")
+            self._reset_tracking()
+            return None
+        
+        boxes_xyxy = detections.boxes.xyxy.cpu().numpy()
+        best_idx = self._find_best_match(boxes_xyxy)
+        
+        if best_idx is None:
+            logger.info("Locked object left frame - resetting")
+            self._reset_tracking()
+        
+        return best_idx
+    
     def find_closest_object(self, detections, current_doa: float) -> Optional[int]:
         """Find object closest to DOA angle, with tracking support.
         
@@ -427,13 +868,10 @@ class AudioVisionFusion:
             Index of closest object or None
         """
         if len(detections.boxes.cls) == 0:
-            # No objects detected - check if locked object is still in frame
+            # No objects detected - reset tracking
             if self.locked_object_id is not None:
                 logger.debug("Locked object out of frame - resetting")
-                self.locked_object_id = None
-                self.locked_object_bbox = None
-                self.sound_detections = []
-                self.sound_confidence = 0.0
+                self._reset_tracking()
             return None
         
         boxes_xyxy = detections.boxes.xyxy.cpu().numpy()
@@ -448,85 +886,43 @@ class AudioVisionFusion:
         # Only lock onto objects within reasonable angular range
         if closest_angle_diff > DOA_LOCK_TOLERANCE:
             logger.debug(f"Closest object at {closest_angle_diff:.1f}° away - too far from DOA (tolerance: {DOA_LOCK_TOLERANCE}°)")
-            # If we had a locked object but sound is now far away, keep tracking but don't increment
+            # Maintain tracking of existing object if still visible
             if self.locked_object_id is not None and self.locked_object_bbox is not None:
-                # Try to maintain tracking of existing object
-                best_iou = 0.0
-                best_idx = None
-                
-                for i, bbox in enumerate(boxes_xyxy):
-                    iou = self.calculate_iou(self.locked_object_bbox, bbox)
-                    if iou > best_iou:
-                        best_iou = iou
-                        best_idx = i
-                
-                if best_iou > TRACKING_IOU_THRESHOLD:
-                    self.locked_object_bbox = boxes_xyxy[best_idx]
-                    logger.debug(f"Maintaining lock without new sound (IoU: {best_iou:.2f})")
+                best_idx = self._find_best_match(boxes_xyxy)
+                if best_idx is not None:
+                    logger.debug("Maintaining lock without new sound")
                     return best_idx
                 else:
                     logger.debug("Lost locked object - resetting")
-                    self.locked_object_id = None
-                    self.locked_object_bbox = None
-                    self.sound_detections = []
-                    self.sound_confidence = 0.0
+                    self._reset_tracking()
             return None
         
-        # Check if we have a locked object and try to find it in current frame
+        # Check if we have a locked object
         current_time = time.time()
         
         if self.locked_object_id is not None and self.locked_object_bbox is not None:
-            # Try to match locked object with current detections using IoU
-            best_iou = 0.0
-            best_idx = None
+            # Try to match locked object with current detections
+            best_idx = self._find_best_match(boxes_xyxy)
             
-            for i, bbox in enumerate(boxes_xyxy):
-                iou = self.calculate_iou(self.locked_object_bbox, bbox)
-                if iou > best_iou:
-                    best_iou = iou
-                    best_idx = i
-            
-            # If we found a good match (IoU > threshold), continue tracking
-            if best_iou > TRACKING_IOU_THRESHOLD:
-                self.locked_object_bbox = boxes_xyxy[best_idx]
-                
-                # Check if the new sound is from the locked object's direction
+            if best_idx is not None:
                 locked_obj_angle = rel_angles[best_idx]
                 angle_to_locked = abs(locked_obj_angle - current_doa)
                 
                 if angle_to_locked < DOA_LOCK_TOLERANCE:
-                    # Sound is from locked object's direction - increment confidence
-                    # Only add if not too recent (debounce to prevent rapid hits)
-                    # Check last detection time to enforce minimum gap
-                    last_detection_time = self.sound_detections[-1][0] if self.sound_detections else 0
-                    time_since_last = current_time - last_detection_time
-                    
-                    if time_since_last > SOUND_HIT_DEBOUNCE:  # Configurable debounce time
-                        self.sound_detections.append((current_time, current_doa))
-                        # Remove old detections (older than configured window)
-                        self.sound_detections = [(t, a) for t, a in self.sound_detections 
-                                                if current_time - t < SOUND_HISTORY_WINDOW]
-                        self.sound_confidence = min(1.0, len(self.sound_detections) / self.max_sound_hits)
-                        logger.info(f"Sound from locked object! Confidence: {self.sound_confidence*100:.0f}% ({len(self.sound_detections)} hits)")
-                    else:
-                        logger.debug(f"Sound detected but too soon ({time_since_last:.1f}s < {SOUND_HIT_DEBOUNCE}s, debounce)")
+                    # Sound is from locked object - increment confidence
+                    self._add_sound_detection(current_time, current_doa)
                 else:
                     logger.debug(f"Sound from different direction ({angle_to_locked:.1f}° away from locked object)")
                 
-                logger.debug(f"Tracking locked object (IoU: {best_iou:.2f})")
+                logger.debug(f"Tracking locked object")
                 return best_idx
             else:
-                # Lost track of locked object - check if closest object is the new target
+                # Lost track - prepare for new lock
                 logger.info("Lost locked object - checking for new target")
-                self.locked_object_id = None
-                self.locked_object_bbox = None
-                self.sound_detections = []
-                self.sound_confidence = 0.0
-                # Fall through to create new lock below
+                self._reset_tracking()
         
-        # No locked object or lost track - create new lock on closest object
-        # First sound detection - start tracking this object
-        self.locked_object_id = closest_idx  # Simple index-based tracking
+        # No locked object - create new lock on closest object
+        self.locked_object_id = closest_idx
         self.locked_object_bbox = boxes_xyxy[closest_idx]
         self.sound_detections = [(current_time, current_doa)]
         self.sound_confidence = 1.0 / self.max_sound_hits
@@ -620,7 +1016,7 @@ class AudioVisionFusion:
             
             # Add "LOCKED" indicator
             if is_locked:
-                label = f"🔒 {label}" if label else "🔒 LOCKED"
+                label = f"[LOCKED] {label}" if label else "[LOCKED]"
             
             if label:
                 # Draw filled background for label for readability
@@ -664,12 +1060,17 @@ class AudioVisionFusion:
             self.initialize_yolo()
             self.initialize_camera()
             
-            logger.info("Starting main processing loop. Press 'q' to quit.")
+            logger.info("Starting main processing loop.")
+            logger.info("Keyboard shortcuts: [q] Quit  [r] Reload config")
             frame_count = 0
             start_time = time.time()
             
             # Main loop: process video frames and overlay detection + audio cues
             while True:
+                # Start performance timing
+                if self.performance_monitor:
+                    self.performance_monitor.start_frame()
+                
                 ret, frame = self.cap.read()
                 if not ret:
                     logger.error("Unable to read from camera.")
@@ -678,44 +1079,18 @@ class AudioVisionFusion:
                 # Run YOLOv10 inference on the frame
                 # Automatically uses TensorRT if .engine file is provided
                 # Pass device explicitly to ensure GPU usage
+                yolo_start = time.time()
                 results = self.model(frame, conf=YOLO_CONFIDENCE_THRESHOLD, verbose=False, device=self.device)
+                yolo_time = time.time() - yolo_start
                 detections = results[0]
-                highlight_idx = None
                 
-                # Check if locked object is still in frame (even without new sound)
-                if self.locked_object_id is not None and self.locked_object_bbox is not None:
-                    if len(detections.boxes.cls) > 0:
-                        boxes_xyxy = detections.boxes.xyxy.cpu().numpy()
-                        best_iou = 0.0
-                        best_idx = None
-                        
-                        for i, bbox in enumerate(boxes_xyxy):
-                            iou = self.calculate_iou(self.locked_object_bbox, bbox)
-                            if iou > best_iou:
-                                best_iou = iou
-                                best_idx = i
-                        
-                        if best_iou > TRACKING_IOU_THRESHOLD:
-                            # Update bbox and set as highlight
-                            self.locked_object_bbox = boxes_xyxy[best_idx]
-                            highlight_idx = best_idx
-                            logger.debug(f"Locked object in frame (IoU: {best_iou:.2f})")
-                        else:
-                            # Lost the object
-                            logger.info("Locked object left frame - resetting")
-                            self.locked_object_id = None
-                            self.locked_object_bbox = None
-                            self.sound_detections = []
-                            self.sound_confidence = 0.0
-                    else:
-                        # No objects detected
-                        logger.info("No objects detected - resetting lock")
-                        self.locked_object_id = None
-                        self.locked_object_bbox = None
-                        self.sound_detections = []
-                        self.sound_confidence = 0.0
+                # Update tracking first (maintains lock even without new sound)
+                highlight_idx = self._update_tracking(detections)
                 
-                # Determine if an audio trigger is active and select target object
+                # Decay heatmap every frame for gradual fade
+                self.decay_audio_heatmap()
+                
+                # Check for new sound trigger and update accordingly
                 with self.audio_trigger_lock:
                     triggered = (time.time() - self.last_trigger_time) < TRIGGER_HOLD_TIME
                     current_doa = self.last_doa_angle if triggered else None
@@ -724,13 +1099,23 @@ class AudioVisionFusion:
                 # This updates confidence for locked objects OR creates new locks
                 if triggered and current_doa is not None:
                     result_idx = self.find_closest_object(detections, current_doa)
-                    # Use the result if we don't already have a highlight from tracking
-                    if highlight_idx is None and result_idx is not None:
+                    if result_idx is not None:
                         highlight_idx = result_idx
+                    
+                    # Add new sound to heatmap
+                    self.update_audio_heatmap(current_doa, intensity=1.0)
+                
+                # Draw audio heatmap first (as background layer)
+                self.draw_audio_heatmap(frame)
                 
                 # Draw detections and status
                 self.draw_detections(frame, detections, highlight_idx)
                 self.draw_status(frame)
+                
+                # Draw performance overlay
+                if self.performance_monitor:
+                    self.performance_monitor.update(yolo_time)
+                    self.performance_monitor.draw_overlay(frame)
                 
                 # Calculate and display FPS
                 frame_count += 1
@@ -741,9 +1126,15 @@ class AudioVisionFusion:
                 
                 # Display the resulting frame
                 cv2.imshow("Audio-Visual Fusion", frame)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
+                
+                # Handle keyboard input
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
                     logger.info("Quit requested by user")
                     break
+                elif key == ord('r'):
+                    # Hot-reload configuration
+                    self.reload_config()
                     
         except KeyboardInterrupt:
             logger.info("Interrupted by user")
@@ -755,6 +1146,14 @@ class AudioVisionFusion:
     def cleanup(self):
         """Clean up resources."""
         logger.info("Cleaning up resources...")
+        
+        # Clean up performance monitor
+        if self.performance_monitor:
+            try:
+                self.performance_monitor.cleanup()
+                logger.info("Performance monitor cleaned up")
+            except Exception as e:
+                logger.warning(f"Error cleaning up performance monitor: {e}")
         
         # Stop audio thread
         self.audio_active = False
