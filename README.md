@@ -286,7 +286,7 @@ You can also edit the configuration constants directly in `audio_vision_fusion.p
 
 ```
 
-## 🔧 Troubleshooting
+
 
 ### Calibration
 
@@ -673,5 +673,6 @@ Potential improvements:
 - Basic YOLO + ReSpeaker integration
 - Simple audio-visual fusion
 - Basic highlighting functionality
+
 
 
