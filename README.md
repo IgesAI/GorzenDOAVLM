@@ -1,4 +1,4 @@
-# Audio-Visual Fusion: YOLO + ReSpeaker DOA# Audio-Visual Fusion: YOLO + ReSpeaker DOA
+# Audio-Visual Fusion: YOLO + ReSpeaker DOA# Audio-Visual Fusion: YOLO + ReSpeaker
 
 
 
@@ -673,6 +673,7 @@ Potential improvements:
 - Basic YOLO + ReSpeaker integration
 - Simple audio-visual fusion
 - Basic highlighting functionality
+
 
 
 
